@@ -3,26 +3,30 @@ import re
 import time
 from pathlib import Path
 
+import httpx
 from googletrans import Translator, LANGUAGES
 
-
 FILE_NAME = "steve_jobs.txt"
-TARGET_LANG = "Irish"  # Irish -> ga (можна також просто "ga")
+TARGET_LANG = "Irish"  # Irish -> ga
 
 DEFAULT_TEXT = """Читачеві вирішувати, вдалося мені досягти цієї мети чи ні. Впевнений, що в цій драмі були персонажі, яким описані мною події запам’яталися дещо інакше, або ж вони вважатимуть, що я час від часу потрапляв у пастку «альтернативної реальності» Джобса. Коли я писав книжку про Генрі Кіссинджера — що стало для мене непоганою підготовкою до цього проекту, — мені також часто траплялося розмовляти з людьми, які виношували дуже гостро позитивні чи то гостро негативні емоції щодо головного героя. І це лише доводить теорію про суб’єктивність людського сприйняття, знаної як «ефект Расьомона». Але я старався якомога справедливіше передати бачення ситуацій конфліктуючих сторін, а також відкрито показувати джерела, з яких надійшла та чи інша інформація."""
 
-# Починаємо з translate.google.com (у тебе воно 100% працює на 1 запиті),
-# а далі маємо fallback.
-SERVICE_URLS = [
-    "translate.google.com",
-    "translate.googleapis.com",
-    "translate.google.ie",
-    "translate.google.co.uk",
-]
+# Твій робочий домен
+SERVICE_URL = "translate.google.com"
+
+# Fallback endpoint (той самий домен!)
+GTX_ENDPOINT = "https://translate.google.com/translate_a/single"
+
+# анти-ліміт
+TIMEOUT_SEC = 20.0
+SYNC_DELAY_SEC = 0.8
+ASYNC_STAGGER_SEC = 0.7
+ASYNC_CONCURRENCY = 2
+RETRIES = 2
 
 
-def _make_translator(url: str) -> Translator:
-    return Translator(service_urls=[url])
+def _translator() -> Translator:
+    return Translator(service_urls=[SERVICE_URL])
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -45,102 +49,151 @@ def _to_lang_code(lang: str) -> str:
 
 # ===== 3.3 CodeLang(lang) =====
 def CodeLang(lang: str) -> str:
-    """Якщо назва -> код, якщо код -> назва."""
+    """
+    Якщо назва -> код, якщо код -> назва.
+    """
     if not isinstance(lang, str) or not lang.strip():
         return "Помилка: порожній параметр lang."
     s = lang.strip()
 
     code = s.lower()
     if code in LANGUAGES:
-        return LANGUAGES[code].title()  # код -> назва
+        return LANGUAGES[code].title()
 
     inv = {name.lower(): code for code, name in LANGUAGES.items()}
     if s.lower() in inv:
-        return inv[s.lower()]  # назва -> код
+        return inv[s.lower()]
 
     return f"Помилка: невідома мова '{lang}'."
 
 
+# ---- fallback translate via gtx (translate.google.com) ----
+def _gtx_translate_sync(text: str, tl: str) -> str:
+    params = {"client": "gtx", "sl": "auto", "tl": tl, "dt": "t", "q": text}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    with httpx.Client(timeout=TIMEOUT_SEC, headers=headers) as client:
+        r = client.get(GTX_ENDPOINT, params=params)
+        r.raise_for_status()
+        data = r.json()
+    return "".join(chunk[0] for chunk in data[0] if chunk and chunk[0])
+
+
+async def _gtx_translate_async(text: str, tl: str, client: httpx.AsyncClient) -> str:
+    params = {"client": "gtx", "sl": "auto", "tl": tl, "dt": "t", "q": text}
+    r = await client.get(GTX_ENDPOINT, params=params)
+    r.raise_for_status()
+    data = r.json()
+    return "".join(chunk[0] for chunk in data[0] if chunk and chunk[0])
+
+
 # ===== 3.2 LangDetect(txt) =====
 def LangDetect(txt: str):
-    """Повертає (lang_code, confidence). Якщо не вдалось — ('', 0.0)."""
+    """
+    Повертає (lang_code, confidence). confidence може бути None — це нормально.
+    Щоб detect не ламався на довгому тексті, беремо короткий семпл.
+    """
     if not isinstance(txt, str) or not txt.strip():
-        return "", 0.0
+        return "", None
 
-    last_err = None
-    for url in SERVICE_URLS:
-        for _ in range(2):  # retry
-            try:
-                t = _make_translator(url)
-                d = t.detect(txt)
-                return d.lang, float(d.confidence)
-            except Exception as e:
-                last_err = e
-                time.sleep(0.35)
+    sample = txt.strip()[:250]  # семпл для стабільності
+    t = _translator()
 
-    return "", 0.0
+    for _ in range(RETRIES):
+        try:
+            d = t.detect(sample)
+            return d.lang, d.confidence
+        except Exception:
+            time.sleep(0.35)
+
+    # fallback: витягнемо src із відповіді translate_a/single
+    try:
+        params = {"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": sample}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        with httpx.Client(timeout=TIMEOUT_SEC, headers=headers) as client:
+            r = client.get(GTX_ENDPOINT, params=params)
+            r.raise_for_status()
+            data = r.json()
+        src = data[2] if len(data) > 2 else ""
+        return src, None
+    except Exception:
+        return "", None
 
 
 # ===== 3.1 TransLate(str, lang) =====
-def TransLate(text, lang: str):
+def TransLate(text: str, lang: str) -> str:
     """
     Повертає переклад або повідомлення про помилку.
-    Підтримує:
-      - text: str
-      - text: list[str]  (batch переклад = менше запитів = стабільніше)
     """
-    code = _to_lang_code(lang)
-    if not code:
+    if not isinstance(text, str) or not text.strip():
+        return "Помилка: порожній текст для перекладу."
+
+    tl = _to_lang_code(lang)
+    if not tl:
         return f"Помилка: невідома мова перекладу '{lang}'."
 
-    if isinstance(text, str):
-        if not text.strip():
-            return "Помилка: порожній текст для перекладу."
-    elif isinstance(text, list):
-        if not text or not any(isinstance(x, str) and x.strip() for x in text):
-            return ["Помилка: порожній текст для перекладу."] * (len(text) if isinstance(text, list) else 1)
-    else:
-        return "Помилка: некоректний тип text."
+    t = _translator()
 
-    last_err = None
-    for url in SERVICE_URLS:
-        for _ in range(2):  # retry
-            try:
-                t = _make_translator(url)
-                res = t.translate(text, dest=code)  # <-- batch працює для list[str]
-                if isinstance(text, list):
-                    return [r.text for r in res]
-                return res.text
-            except Exception as e:
-                last_err = e
-                time.sleep(0.35)
+    # 1) пробуємо googletrans
+    for _ in range(RETRIES):
+        try:
+            return t.translate(text, dest=tl).text
+        except Exception:
+            time.sleep(0.35)
 
-    # якщо це список — повернемо список помилок
-    if isinstance(text, list):
-        return [f"Помилка перекладу: {type(last_err).__name__}: {last_err}"] * len(text)
-    return f"Помилка перекладу: {type(last_err).__name__}: {last_err}"
+    # 2) fallback gtx (translate.google.com)
+    for _ in range(RETRIES):
+        try:
+            return _gtx_translate_sync(text, tl)
+        except Exception as e:
+            last = e
+            time.sleep(0.35)
+
+    return f"Помилка перекладу: {type(last).__name__}: {last}"
 
 
+# ===== 3.4.1 SYNC =====
 def run_sync(full_text: str, TxtList: list[str], target_lang: str):
     start = time.perf_counter()
 
     orig_code, orig_conf = LangDetect(full_text)
-    translated_list = TransLate(TxtList, target_lang)  # batch
+
+    translated = []
+    for i, s in enumerate(TxtList):
+        translated.append(TransLate(s, target_lang))
+        if i != len(TxtList) - 1:
+            time.sleep(SYNC_DELAY_SEC)
 
     elapsed = time.perf_counter() - start
-    return orig_code, orig_conf, translated_list, elapsed
+    return orig_code, orig_conf, " ".join(translated), elapsed
 
 
+# ===== 3.4.2 ASYNC =====
 async def run_async(full_text: str, TxtList: list[str], target_lang: str):
     start = time.perf_counter()
+    sem = asyncio.Semaphore(ASYNC_CONCURRENCY)
+
+    tl = _to_lang_code(target_lang)
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    async def translate_one(i: int, sentence: str, client: httpx.AsyncClient) -> str:
+        await asyncio.sleep(i * ASYNC_STAGGER_SEC)
+        async with sem:
+            # 1) googletrans у потоці
+            try:
+                t = _translator()
+                return await asyncio.to_thread(lambda: t.translate(sentence, dest=tl).text)
+            except Exception:
+                # 2) fallback gtx
+                return await _gtx_translate_async(sentence, tl, client)
 
     detect_task = asyncio.to_thread(LangDetect, full_text)
-    translate_task = asyncio.to_thread(TransLate, TxtList, target_lang)  # batch у фоні
 
-    (orig_code, orig_conf), translated_list = await asyncio.gather(detect_task, translate_task)
+    async with httpx.AsyncClient(timeout=TIMEOUT_SEC, headers=headers) as client:
+        translate_tasks = [translate_one(i, s, client) for i, s in enumerate(TxtList)]
+        (orig_code, orig_conf), translated = await asyncio.gather(detect_task, asyncio.gather(*translate_tasks))
 
     elapsed = time.perf_counter() - start
-    return orig_code, orig_conf, translated_list, elapsed
+    return orig_code, orig_conf, " ".join(translated), elapsed
 
 
 def main():
@@ -165,9 +218,10 @@ def main():
     print(f"Кількість речень в тексті: {len(TxtList)}")
 
     # SYNC
-    orig_code_s, orig_conf_s, tr_s, time_s = run_sync(text, TxtList, TARGET_LANG)
+    orig_code_s, orig_conf_s, tr_s, t_sync = run_sync(text, TxtList, TARGET_LANG)
     orig_name_s = CodeLang(orig_code_s) if orig_code_s else "невідомо"
-    print(f"Мова оригінального тексту: {orig_name_s} | код: {orig_code_s or '—'} | confidence: {orig_conf_s if orig_conf_s else '—'}")
+    conf_print = orig_conf_s if orig_conf_s is not None else "—"
+    print(f"Мова оригінального тексту: {orig_name_s} | код: {orig_code_s or '—'} | confidence: {conf_print}")
 
     print("\nОРИГІНАЛЬНИЙ ТЕКСТ:")
     print(text.strip())
@@ -175,15 +229,13 @@ def main():
     print(f"\nМова перекладу: {target_name} | код: {target_code or '—'}")
 
     print("\nПЕРЕКЛАД ТЕКСТУ (SYNC):")
-    if isinstance(tr_s, list):
-        print(" ".join(tr_s))
-    else:
-        print(tr_s)
-    print(f"\nЧас (визначення мови + переклад) SYNC: {time_s:.4f} c")
+    print(tr_s)
+
+    print(f"\nЧас (визначення мови + переклад) SYNC: {t_sync:.4f} c")
 
     # ASYNC
-    orig_code_a, orig_conf_a, tr_a, time_a = asyncio.run(run_async(text, TxtList, TARGET_LANG))
-    print(f"Час (визначення мови + переклад) ASYNC: {time_a:.4f} c")
+    orig_code_a, orig_conf_a, tr_a, t_async = asyncio.run(run_async(text, TxtList, TARGET_LANG))
+    print(f"Час (визначення мови + переклад) ASYNC: {t_async:.4f} c")
 
 
 if __name__ == "__main__":
